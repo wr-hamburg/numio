@@ -1,0 +1,203 @@
+#include <mpi.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <inttypes.h>
+#include <limits.h>
+#include "helperfunctions.h"
+#include "iofunctions.h"
+
+void printBackend()
+{
+    printf("MPI Async");
+}
+
+union FileDescriptor openFile(uint64_t rank, struct options* options)
+{
+    union FileDescriptor fd;
+    MPI_Comm comm;
+
+    if (options->file_per_process == PROCESS_LOCAL_FILE)
+    {
+        comm = MPI_COMM_SELF;
+    }
+    else
+    {
+        comm = MPI_COMM_WORLD;
+    }
+
+    if (MPI_File_open(comm, options->path_to_write_file, MPI_MODE_CREATE | MPI_MODE_WRONLY, MPI_INFO_NULL, &(fd.mpi)) != MPI_SUCCESS)
+    {
+        fprintf(stderr, "Rank %"PRIu64" couldn't open file %s\n", rank, options->path_to_write_file);
+        exit(1);
+    }
+
+    return fd;
+}
+
+void closeFile(union FileDescriptor* fd)
+{
+    MPI_File_close(&fd->mpi);
+}
+
+static void calculateOffsets(uint64_t const N, struct options const* options, struct process_data const* process_data, uint64_t* offset_file, uint64_t* size)
+{
+    uint64_t const rank = process_data->rank;
+    uint64_t const last_rank = process_data->world_size - 1;
+
+    uint64_t lines_to_write = (process_data->num_lines_with_halo - 1);
+
+    if (rank != last_rank && rank != 0)
+    {
+        lines_to_write--;
+    }
+
+    *size = lines_to_write * N;
+
+    if (options->file_per_process == PROCESS_LOCAL_FILE)
+    {
+        *offset_file = 0;
+    }
+    else
+    {
+        *offset_file = process_data->global_start * N * sizeof(double);
+    }
+}
+
+uint64_t writeMatrixToFile(double const* M, uint64_t const N, struct options const* options, struct process_data* process_data, union FileDescriptor* fd, size_t const curr_fd)
+{
+    static int initialized = 0;
+    static uint64_t size_of_write;
+    static uint64_t offset_for_write;
+    int size_of_single_write = 0;
+    uint64_t counter = 0;
+    uint64_t offset_req_array = 0;
+    uint64_t elements_written = 0;
+    static uint64_t max_elem_for_single_write = (INT_MAX / sizeof(double)) - (2 << 8) + 1;
+
+    if (!initialized)
+    {
+        calculateOffsets(N, options, process_data, &offset_for_write, &size_of_write);
+        process_data->expected_write_size = 0;
+        process_data->request_arr_len = (size_of_write / max_elem_for_single_write) + 1;
+        process_data->request_arr_len *= options->num_files_per_proc;
+        process_data->request_arr = malloc(sizeof(MPI_Request) * process_data->request_arr_len);
+        initialized = 1;
+    }
+
+    offset_req_array = curr_fd * (process_data->request_arr_len / options->num_files_per_proc);
+
+    while (elements_written != size_of_write)
+    {
+        //Some old MPI versions crash when the size of a single write exceeds INT_MAX bytes.
+        //In particular, trying to write even one more element than (INT_MAX / sizeof(double)) - (2 << 8) + 1 doubles at once is not possible
+        //with some implementations and we can't check for the exact number of elements written until the wait for completion, at which
+        //point everything is already supposed to be written. So we restrict the max write to that size.
+        if ((size_of_write - elements_written) >= max_elem_for_single_write)
+        {
+            size_of_single_write = max_elem_for_single_write;
+        }
+        else
+        {
+            size_of_single_write = size_of_write - elements_written;
+        }
+
+        MPI_Request req;
+        if (MPI_File_iwrite_at(fd->mpi, offset_for_write + elements_written*sizeof(double), M + process_data->address_offset + elements_written, size_of_single_write, MPI_DOUBLE, &req) != MPI_SUCCESS)
+        {
+            fprintf(stderr, "Write failed at rank %"PRIu64", exiting...\n", process_data->rank);
+            exit(1);
+        }
+
+        process_data->request_arr[counter+offset_req_array] = req;
+        counter++;
+
+        elements_written += size_of_single_write;
+    }
+
+    process_data->expected_write_size += elements_written;
+    return elements_written * sizeof(double);
+}
+
+void waitForCompletion(struct process_data* process_data)
+{
+    uint64_t written_elements = 0;
+    for (uint64_t i = 0; i < process_data->request_arr_len; i++)
+    {
+        MPI_Status status;
+        MPI_Wait(&process_data->request_arr[i], &status);
+
+        int count;
+        MPI_Get_count(&status, MPI_DOUBLE, &count);
+        written_elements += count;
+    }
+
+    if (written_elements != process_data->expected_write_size)
+    {
+        fprintf(stderr, "Write failed at rank %"PRIu64", written elements: %"PRIu64", supposed write size: %"PRIu64"\n", process_data->rank, written_elements, process_data->expected_write_size);
+        exit(1);
+    }
+
+    process_data->expected_write_size = 0;
+}
+
+void fileSync(union FileDescriptor const* fd)
+{
+    MPI_File_sync(fd->mpi);
+}
+
+union FileDescriptor openFileForRead(char const* path)
+{
+    union FileDescriptor fd;
+    if (MPI_File_open(MPI_COMM_WORLD, path, MPI_MODE_RDONLY, MPI_INFO_NULL, &(fd.mpi)) != MPI_SUCCESS)
+    {
+        fprintf(stderr, "Couldn't open file %s\n", path);
+        exit(1);
+    }
+    return fd;
+}
+
+uint64_t readMatrixFromFile(double* M, uint64_t const N, struct options const* options, struct process_data const* process_data, union FileDescriptor* fd)
+{
+    static int initialized = 0;
+    static uint64_t size_of_read;
+    static uint64_t offset_for_read;
+    int size_of_single_read = 0;
+    uint64_t elements_read = 0;
+
+    if (!initialized)
+    {
+        calculateOffsets(N, options, process_data, &offset_for_read, &size_of_read);
+        initialized = 1;
+    }
+
+    while (elements_read != size_of_read)
+    {
+        if (size_of_read - elements_read > INT_MAX)
+        {
+            size_of_single_read = INT_MAX;
+        }
+        else
+        {
+            size_of_single_read = size_of_read - elements_read;
+        }
+
+        MPI_Status status;
+        if (MPI_File_read_at(fd->mpi, offset_for_read + elements_read*sizeof(double), M + process_data->address_offset + elements_read, size_of_single_read, MPI_DOUBLE, &status) != MPI_SUCCESS)
+        {
+            fprintf(stderr, "Read failed at rank %"PRIu64", exiting...\n", process_data->rank);
+            exit(1);
+        }
+
+        int count;
+        MPI_Get_count(&status, MPI_DOUBLE, &count);
+        if (count != size_of_single_read)
+        {
+            fprintf(stderr, "Read failed at rank %"PRIu64", read elements: %d, supposed read size: %d\n", process_data->rank, count, size_of_single_read);
+            exit(1);
+        }
+
+        elements_read += count;
+    }
+
+    return elements_read * sizeof(double);
+}

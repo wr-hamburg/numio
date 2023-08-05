@@ -1,0 +1,12 @@
+.vscode
+*.o
+*.out
+*.h5
+*.nc
+numio-adios2
+numio-hdf5
+numio-mpiasync
+numio-mpisplitcoll
+numio-mpisync
+numio-netcdf
+numio-posix
